@@ -20,6 +20,9 @@ import (
 	"context"
 	"github.com/go-logr/logr"
 	batchv1 "k8s.io/api/batch/v1"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/reference"
 	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -37,8 +40,9 @@ type CronJobReconciler struct {
 }
 
 var (
-	jobOwnerKey = ".metadata.controller"
-	apiGVStr    = mybatchv1.GroupVersion.String()
+	jobOwnerKey             = ".metadata.controller"
+	apiGVStr                = mybatchv1.GroupVersion.String()
+	scheduledTimeAnnotation = "batch.tutorial.kubebuilder.io/scheduled-at"
 )
 
 type realClock struct{}
@@ -51,15 +55,13 @@ type Clock interface {
 	now() time.Time
 }
 
+// +kubebuilder:docs-gen:collapse=Clock
+
 //+kubebuilder:rbac:groups=batch.tutorial.kubebuilder.io,resources=cronjobs,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=batch.tutorial.kubebuilder.io,resources=cronjobs/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=batch.tutorial.kubebuilder.io,resources=cronjobs/finalizers,verbs=update
 //+kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=batch,resources=jobs/status,verbs=get
-
-var (
-	scheduledTimeAnnotation = "batch.tutorial.kubebuilder.io/scheduled-at"
-)
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -89,10 +91,88 @@ func (r *CronJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	// get childJobs status
-	//var activeJobs []*batchv1.Job
-	//var successfulJobs []*batchv1.Job
-	//var faildJobs []*batchv1.Job
-	//var mostRecentTime *time.Time
+	var activeJobs []*batchv1.Job
+	var successfulJobs []*batchv1.Job
+	var failedJobs []*batchv1.Job
+	var mostRecentTime *time.Time
+
+	// isJobFinished
+	isJobFinished := func(job *batchv1.Job) (bool, batchv1.JobConditionType) {
+		for _, c := range job.Status.Conditions {
+			if (c.Type == batchv1.JobComplete || c.Type == batchv1.JobFailed) && c.Status == v1.ConditionTrue {
+				return true, c.Type
+			}
+		}
+		return false, ""
+	}
+	// +kubebuilder:docs-gen:collapse=isJobFinished
+
+	// getScheduledTimeForJob
+	getScheduledTimeForJob := func(job *batchv1.Job) (*time.Time, error) {
+		timeRaw := job.Annotations[scheduledTimeAnnotation]
+		if len(timeRaw) == 0 {
+			return nil, nil
+		}
+		timeParsed, err := time.Parse(time.RFC3339, timeRaw)
+		if err != nil {
+			return nil, err
+		}
+		return &timeParsed, nil
+	}
+	// +kubebuilder:docs-gen:collapse=getScheduledTimeForJob
+
+	// handle childJobs
+	for i, job := range childJobs.Items {
+		_, finishedType := isJobFinished(&job)
+		switch finishedType {
+		case "": //ongoing
+			activeJobs = append(activeJobs, &childJobs.Items[i])
+		case batchv1.JobFailed:
+			failedJobs = append(failedJobs, &childJobs.Items[i])
+		case batchv1.JobComplete:
+			successfulJobs = append(successfulJobs, &childJobs.Items[i])
+		}
+
+		// get mostRecentTime
+		scheduledTimeForJob, err := getScheduledTimeForJob(&job)
+		if err != nil {
+			log.Error(err, "unable to parse schedule time for child job", "job", &job)
+			continue
+		}
+		if scheduledTimeForJob != nil {
+			if mostRecentTime == nil {
+				mostRecentTime = scheduledTimeForJob
+			} else if mostRecentTime.Before(*scheduledTimeForJob) {
+				mostRecentTime = scheduledTimeForJob
+			}
+		}
+	}
+
+	// handle cronjob status
+	if mostRecentTime != nil {
+		cronJob.Status.LastScheduleTime = &metav1.Time{*mostRecentTime}
+	} else {
+		cronJob.Status.LastScheduleTime = nil
+	}
+	cronJob.Status.Active = nil
+	for _, activeJob := range activeJobs {
+		jobRef, err := reference.GetReference(r.Scheme, activeJob)
+		if err != nil {
+			log.Error(err, "unable to make reference to active job", "job", activeJob)
+			continue
+		}
+		cronJob.Status.Active = append(cronJob.Status.Active, *jobRef)
+	}
+
+	log.V(1).Info("job count", "active jobs", len(activeJobs),
+		"successful jobs", len(successfulJobs), "failed jobs", len(failedJobs))
+
+	if err := r.Status().Update(ctx, &cronJob); err != nil {
+		log.Error(err, "unable to cronjob status")
+		return ctrl.Result{}, err
+	}
+
+	// 3 Clean up old jobs according to the history limit
 
 	return ctrl.Result{}, nil
 }
